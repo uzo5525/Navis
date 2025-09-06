@@ -1,0 +1,14 @@
+.venv/
+.venv1/
+.idea/
+
+__pycache__/
+*.pyc
+
+*.log
+*.wav
+*.png
+
+models/
+yolov5/
+dev/
