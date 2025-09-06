@@ -12,3 +12,7 @@ __pycache__/
 models/
 yolov5/
 dev/
+
+prac.py
+yolo_test.py
+test.py
