@@ -4,13 +4,18 @@ import threading
 import cv2
 import platform
 from ultralytics import YOLO
-import numpy as np
 from collections import deque
 
 import pyttsx3
 import pythoncom
 import time
 
+import re
+import numpy as np
+import pytesseract
+pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+
+# tts
 class Speaker:
     def __init__(self, lang='ko', rate='175'):
         self.q = queue.Queue(maxsize=1)
@@ -47,6 +52,7 @@ class Speaker:
             except Exception as e:
                 print("[TTS ERROR]", e)
 
+# smoothing 작업
 class StateSmoother:
     def __init__(self, window=10, min_frames=4, ratio=0.6):
         self.history = deque(maxlen=window)
@@ -88,6 +94,53 @@ class BoxSmoother:
         self.prev[key] = cur
         return cur
 
+def crop_box(frame, box, pad=[10, 100, 10, 100]):
+    h, w = frame.shape[:2]
+    x1, y1, x2, y2 = map(int, box)
+    nx1 = max(0, x1 - pad[0])
+    ny1 = max(0, y1 - pad[1])
+    nx2 = min(w, x2 + pad[2])
+    ny2 = min(h, y2 + pad[3])
+    crop = frame[ny1:ny2, nx1:nx2]
+
+    return crop, (nx1,ny1,nx2,ny2)
+
+def digit_read(frame, color):
+
+    if color == 'red':
+        g = frame[:, :, 2]
+    elif color == 'green':
+        g = frame[:, :, 1]
+
+    g = cv2.equalizeHist(g)
+    g = cv2.GaussianBlur(g, (3, 3), 0)
+
+    _, th1 = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+    _, th2 = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
+
+    k = np.ones((2, 2), np.uint8)
+    th1 = cv2.morphologyEx(th1, cv2.MORPH_CLOSE, k, 1)
+    th2 = cv2.morphologyEx(th2, cv2.MORPH_CLOSE, k, 1)
+    th1 = cv2.morphologyEx(th1, cv2.MORPH_OPEN, k, 1)
+    th2 = cv2.morphologyEx(th2, cv2.MORPH_OPEN, k, 1)
+
+    th1 = cv2.resize(th1, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_NEAREST)
+    th2 = cv2.resize(th2, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_NEAREST)
+
+    cfg = "--oem 1 --psm 7 -c tessedit_char_whitelist=0123456789"
+
+    for th in (th1, th2):
+        txt = pytesseract.image_to_string(th, config=cfg)
+        m = re.search(r"(\d+)", txt)
+        if not m:
+            continue
+        v = int(m.group(1))
+        if 0 <= v <= 99:
+            return v
+    return None
+
+
+# os 구분(노트북 : 시험용, 라즈베리파이 : 실전용)
 os = platform.system().lower()
 if os == 'windows':
     cap = cv2.VideoCapture(1, cv2.CAP_DSHOW)
@@ -96,7 +149,8 @@ elif os == 'linux':
 else:
     raise TypeError('os를 인식할 수 없습니다')
 
-model = YOLO("D:/dev/deocent/models/best2.pt")
+# model 위치
+model = YOLO("D:/dev/navis/models/best2.pt")
 model.model.names = {
     0: 'crosswalk',
     1: 'trafficlight_red',
@@ -109,17 +163,22 @@ cv2.namedWindow(window_name, cv2.WINDOW_AUTOSIZE)
 speaker = Speaker()
 last_announced = None
 last_time = 0
+last_light = None
+last_seen = 0
+no_signal_wait = 1.2
+cross_since = 0.0
 
 smoother = StateSmoother(window=10, min_frames=4, ratio=0.6)
 box_smoother = BoxSmoother(alpha=0.4)
 
+# 메인 코드
 while True:
     ok, frame = cap.read()
     if not ok:
         print('프레임 읽기 실패')
         break
 
-    result = model.predict(frame, imgsz=416, conf=0.3, verbose=False, device='cpu')
+    result = model.predict(frame, imgsz=416, conf=0.2, verbose=False, device='cpu')
     r = result[0]
     boxes_obj = r.boxes
 
@@ -130,6 +189,7 @@ while True:
     best = {'crosswalk': None, 'trafficlight_red': None, 'trafficlight_green': None}
     best_conf = {'crosswalk': -1.0, 'trafficlight_red': -1.0, 'trafficlight_green': -1.0}
     if boxes_obj:
+
         for b in boxes_obj:
             arr = b.xyxy.cpu().numpy()
             arr = arr.astype(int)
@@ -159,15 +219,45 @@ while True:
     smoother.push(cross, red, green)
     cross_stable, light = smoother.get_stable()
 
+    now = time.time()
+
+    if cross_stable:
+        if cross_since == 0.0:
+            cross_since = now
+    else:
+        cross_since = 0.0
+
+    if light is not None:
+        last_light = light
+        last_seen = now
+    else:
+        if now - last_seen < 1.2:
+            light = last_light
+
+    suppress_no_signal = False
+    if cross_stable and (light is None):
+        if cross_since > 0.0 and (now - cross_since) < no_signal_wait:
+            suppress_no_signal = True
+
+    num = None
+    if cross_stable and light in ("red", "green"):
+        key = "trafficlight_red" if light == "red" else "trafficlight_green"
+        box = best.get(key)
+        if box:
+            crop, _ = crop_box(frame, box)
+            num = digit_read(crop, light)
 
     announced = None
     if cross_stable:
-        if light == 'red':
-            announced = '빨간 불입니다. 멈추세요'
-        elif light == 'green':
-            announced = '초록 불입니다. 조심하세요'
+        if light == "red":
+            announced = (f"빨간 불입니다. {num}초 남았습니다. 멈추세요"
+                         if num is not None else "빨간 불입니다. 멈추세요")
+        elif light == "green":
+            announced = (f"초록 불입니다. {num}초 남았습니다. 조심하세요"
+                         if num is not None else "초록 불입니다. 조심하세요")
         else:
-            announced = '신호등이 없는 횡단보도입니다. 조심하세요'
+            if not suppress_no_signal:
+                announced = "신호등이 없는 횡단보도입니다. 조심하세요"
 
     if announced and (announced != last_announced or time.time() - last_time > 5):
         speaker.say(announced)
